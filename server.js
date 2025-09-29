@@ -1,309 +1,337 @@
-// server.js – Halo Grunt (prod-ready skeleton with CSR endpoint)
+// server.js — Halo Grunt (clean replacement)
+// Node 18+ (fetch available). Requires express & cors.
 
 import express from "express";
 import cors from "cors";
-import { ConfidentialClientApplication, LogLevel } from "@azure/msal-node";
-import { fetch } from "undici";
 
-/* -------------------- ENV REQUIRED --------------------
-   ADMIN_KEY                -> Your admin key (simple shared secret)
-   GRUNT_SHARED_SECRET      -> Shared secret the Worker/Wrapper will send (x-grunt-auth)
-   AZURE_CLIENT_ID          -> App (client) ID from Azure App Registration
-   AZURE_CLIENT_SECRET      -> Client secret VALUE
-   AZURE_TENANT_ID          -> Directory (tenant) ID (use 'consumers' in authority below, but we still store this for status)
-   AZURE_REDIRECT_URI       -> e.g. https://<your-grunt>.up.railway.app/callback
-   AZURE_AUTHORITY          -> https://login.microsoftonline.com/consumers  (for personal Microsoft accounts)
-   HALO_ENDPOINT            -> default: https://halostats.svc.halowaypoint.com/hi/players/{gamertag}/csrs?playlist={playlistId}
--------------------------------------------------------- */
+// ------------------------------
+// Config
+// ------------------------------
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const AUTHORITY = (process.env.AZURE_AUTHORITY || "https://login.live.com/consumers").replace(/\/+$/, "");
+const CLIENT_ID = process.env.AZURE_CLIENT_ID || "";
+const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET || "";
+const REDIRECT_URI = process.env.AZURE_REDIRECT_URI || "";
+const GRUNT_SHARED_SECRET = process.env.GRUNT_SHARED_SECRET || "";
 
-const {
-  PORT = "3000",
-  ADMIN_KEY,
-  GRUNT_SHARED_SECRET,
-  AZURE_CLIENT_ID,
-  AZURE_CLIENT_SECRET,
-  AZURE_TENANT_ID,
-  AZURE_REDIRECT_URI,
-  AZURE_AUTHORITY = "https://login.microsoftonline.com/consumers",
-  HALO_ENDPOINT = "https://halostats.svc.halowaypoint.com/hi/players/{gamertag}/csrs?playlist={playlistId}"
-} = process.env;
-
-if (!ADMIN_KEY || !GRUNT_SHARED_SECRET || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET || !AZURE_REDIRECT_URI) {
-  console.error("Missing one or more required ENV vars. Please set ADMIN_KEY, GRUNT_SHARED_SECRET, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_REDIRECT_URI.");
-  process.exit(1);
+// Basic validation
+function requireEnv(name, val) {
+  if (!val) {
+    console.error(`Missing required env ${name}`);
+    process.exit(1);
+  }
 }
+requireEnv("ADMIN_KEY", ADMIN_KEY);
+requireEnv("AZURE_CLIENT_ID", CLIENT_ID);
+requireEnv("AZURE_CLIENT_SECRET", CLIENT_SECRET);
+requireEnv("AZURE_REDIRECT_URI", REDIRECT_URI);
+requireEnv("GRUNT_SHARED_SECRET", GRUNT_SHARED_SECRET);
 
+// ------------------------------
+// Express
+// ------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// --------------------- MSAL Setup ---------------------
-const msalConfig = {
-  auth: {
-    clientId: AZURE_CLIENT_ID,
-    authority: AZURE_AUTHORITY,
-    clientSecret: AZURE_CLIENT_SECRET,
-  },
-  system: {
-    loggerOptions: { logLevel: LogLevel.Warning }
-  }
-};
-
-const msalClient = new ConfidentialClientApplication(msalConfig);
-
-// We'll keep a single signed-in account in memory (simple + good for single-user dummy account)
-let cachedAccount = null;
+// ------------------------------
+// In-memory token store (simple)
+// ------------------------------
 let tokenStore = {
-  // For debugging: last-signin
-  lastSignin: null,
-  // iso date expiry of XSTS/Spartan (not critical, but nice to track)
-  xstsExpiresAt: null,
-  spartanExpiresAt: null,
+  access_token: null,
+  refresh_token: null,
+  expires_at: 0, // epoch ms
 };
 
-// Scopes sufficient to get the Xbox RPS token (the important one is xboxlive.signin)
-const OAUTH_SCOPES = ["xboxlive.signin", "offline_access", "openid", "profile"];
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
 
-// --------------------- Helpers ---------------------
+function msUntilExpiry() {
+  return Math.max(0, tokenStore.expires_at * 1000 - Date.now());
+}
 
-const ok = (res, data) => res.json(data);
-const bad = (res, code, msg) => res.status(code).json({ error: msg });
-
-function mustAdmin(req, res, next) {
-  const key = (req.query.key || req.headers["x-admin-key"] || "").toString().trim();
-  if (!ADMIN_KEY || key !== ADMIN_KEY) return bad(res, 403, "forbidden");
+// ------------------------------
+// Helpers
+// ------------------------------
+function adminGuard(req, res, next) {
+  if (req.query.key !== ADMIN_KEY) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
   next();
 }
 
-function mustWrapper(req, res, next) {
-  const h = (req.headers["x-grunt-auth"] || "").toString().trim();
-  if (!GRUNT_SHARED_SECRET || h !== GRUNT_SHARED_SECRET) return bad(res, 401, "unauthorized");
-  next();
-}
-
-// Build URL with params safely
-function fillHaloEndpoint(template, { gamertag, playlistId }) {
-  return template
-    .replace("{gamertag}", encodeURIComponent(gamertag))
-    .replace("{playlistId}", encodeURIComponent(playlistId));
-}
-
-// Pretty time helper
-function isoPlusSecs(secs) {
-  return new Date(Date.now() + secs * 1000).toISOString();
-}
-
-// --------------------- Auth Flow ---------------------
-
-// 1) Start the OAuth code flow
-app.get("/auth/start", mustAdmin, async (req, res) => {
-  try {
-    const url = await msalClient.getAuthCodeUrl({
-      scopes: OAUTH_SCOPES,
-      redirectUri: AZURE_REDIRECT_URI,
-      responseMode: "query"
-    });
-    res.redirect(url);
-  } catch (e) {
-    console.error("auth/start error:", e);
-    bad(res, 500, "auth_start_failed");
+function logHttpError(prefix, res, body) {
+  console.error(`${prefix} failed: ${res.status}`);
+  if (body) {
+    try {
+      const j = JSON.parse(body);
+      console.error(`${prefix} body:`, JSON.stringify(j, null, 2));
+    } catch {
+      console.error(`${prefix} body:`, body.slice(0, 4000));
+    }
   }
-});
+}
 
-// 2) OAuth redirect (Azure -> this service)
-app.get("/callback", async (req, res) => {
-  try {
-    const tokenResp = await msalClient.acquireTokenByCode({
-      code: req.query.code,
-      scopes: OAUTH_SCOPES,
-      redirectUri: AZURE_REDIRECT_URI
-    });
-
-    cachedAccount = tokenResp.account;
-    tokenStore.lastSignin = new Date().toISOString();
-
-    res.send("Signed in! You can close this window.");
-  } catch (e) {
-    console.error("callback error:", e);
-    bad(res, 500, "callback_failed");
-  }
-});
-
-// 3) Mint an AAD access token silently (refresh if needed)
-async function acquireMsAccessToken() {
-  if (!cachedAccount) throw new Error("no_account_signed_in");
-
-  const resp = await msalClient.acquireTokenSilent({
-    account: cachedAccount,
-    scopes: OAUTH_SCOPES
+// Exchange CODE -> TOKENS or REFRESH -> TOKENS at login.live.com
+async function tokenRequest(params) {
+  const url = `${AUTHORITY}/oauth20_token.srf`;
+  const body = new URLSearchParams(params);
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
   });
-  return resp.accessToken; // This token is used as the RPS ticket in Xbox auth
+  const text = await r.text();
+  if (!r.ok) {
+    logHttpError("oauth/token", r, text);
+    throw new Error(`oauth token failed: ${r.status}`);
+  }
+  const json = JSON.parse(text);
+  return json;
 }
 
-// --------------------- Xbox / XSTS / Spartan ---------------------
+async function ensureAccessToken() {
+  // If missing but we have refresh, refresh
+  if (!tokenStore.access_token && tokenStore.refresh_token) {
+    await refreshAccessToken();
+  }
+  // If present but expiring in <60s, refresh
+  if (tokenStore.access_token && msUntilExpiry() < 60_000) {
+    await refreshAccessToken();
+  }
+  if (!tokenStore.access_token) {
+    throw new Error("No access token present; call /auth/start and sign in.");
+  }
+  return tokenStore.access_token;
+}
 
-// Xbox User Authenticate -> returns userToken + uhs
-async function xboxUserAuthenticate(msAccessToken) {
-  const payload = {
+async function refreshAccessToken() {
+  if (!tokenStore.refresh_token) return;
+  const json = await tokenRequest({
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    grant_type: "refresh_token",
+    refresh_token: tokenStore.refresh_token,
+    redirect_uri: REDIRECT_URI,
+  });
+  tokenStore.access_token = json.access_token || null;
+  tokenStore.refresh_token = json.refresh_token || tokenStore.refresh_token;
+  // expires_in is seconds from now
+  tokenStore.expires_at = nowSec() + (json.expires_in || 3600);
+}
+
+// Xbox Live chain: User → XSTS
+async function getXblUserToken(msAccessToken) {
+  const url = "https://user.auth.xboxlive.com/user/authenticate";
+  const body = {
     RelyingParty: "http://auth.xboxlive.com",
     TokenType: "JWT",
     Properties: {
       AuthMethod: "RPS",
       SiteName: "user.auth.xboxlive.com",
-      RpsTicket: `d=${msAccessToken}`
-    }
+      RpsTicket: `d=${msAccessToken}`,
+    },
   };
-
-  const r = await fetch("https://user.auth.xboxlive.com/user/authenticate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  if (!r.ok) throw new Error(`xbox user.auth failed: ${r.status}`);
-  const j = await r.json();
-  const uhs = j?.DisplayClaims?.xui?.[0]?.uhs;
-  if (!uhs) throw new Error("xbox user.auth missing uhs");
-  return { userToken: j.Token, uhs };
-}
-
-// XSTS Authorize -> returns xstsToken
-async function xboxXstsAuthorize(userToken) {
-  const payload = {
-    RelyingParty: "rp://api.minecraftservices.com/",
-    TokenType: "JWT",
-    Properties: {
-      SandboxId: "RETAIL",
-      UserTokens: [userToken]
-    }
-  };
-
-  const r = await fetch("https://xsts.auth.xboxlive.com/xsts/authorize", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  if (!r.ok) throw new Error(`xsts authorize failed: ${r.status}`);
-  const j = await r.json();
-  return j.Token;
-}
-
-// Spartan token from Waypoint (requires XBL3.0 Authorization)
-async function getSpartanToken({ uhs, xstsToken }) {
-  const authHeader = `XBL3.0 x=${uhs};${xstsToken}`;
-
-  const r = await fetch("https://settings.svc.halowaypoint.com/spartan-token", {
+  const r = await fetch(url, {
     method: "POST",
     headers: {
-      "Authorization": authHeader,
-      "Accept": "application/json"
-    }
+      "Content-Type": "application/json",
+      "x-xbl-contract-version": "1",
+    },
+    body: JSON.stringify(body),
   });
-
-  if (!r.ok) throw new Error(`spartan-token failed: ${r.status}`);
-  const j = await r.json(); // { spartanToken, expiresInSeconds? }
-  return j;
+  const text = await r.text();
+  if (!r.ok) {
+    logHttpError("xbl-user", r, text);
+    throw new Error(`xbl-user failed: ${r.status}`);
+  }
+  return JSON.parse(text);
 }
 
-// Perform whole chain & return headers needed for Waypoint stats APIs
-async function buildHaloHeaders() {
-  const msAccess = await acquireMsAccessToken();
-  const { userToken, uhs } = await xboxUserAuthenticate(msAccess);
-  const xstsToken = await xboxXstsAuthorize(userToken);
-  const spartan = await getSpartanToken({ uhs, xstsToken });
+async function getXstsToken(userToken) {
+  const url = "https://xsts.auth.xboxlive.com/xsts/authorize";
+  const body = {
+    Properties: {
+      SandboxId: "RETAIL",
+      UserTokens: [userToken],
+    },
+    RelyingParty: "http://xboxlive.com",
+    TokenType: "JWT",
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-xbl-contract-version": "1",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  if (!r.ok) {
+    logHttpError("xsts", r, text);
+    throw new Error(`xsts failed: ${r.status}`);
+  }
+  return JSON.parse(text);
+}
 
-  // Record expiries if present
-  if (spartan?.expires_in) tokenStore.spartanExpiresAt = isoPlusSecs(Number(spartan.expires_in));
-  tokenStore.xstsExpiresAt = isoPlusSecs(3600); // typical XSTS TTL
+// Spartan token — the URL can vary by deployment. If you already had one,
+// keep using it. Otherwise this placeholder will at least show the 400 body
+// so we can correct it next.
+const SPARTAN_TOKEN_URL =
+  process.env.SPARTAN_TOKEN_URL ||
+  "https://settings.svc.halowaypoint.com/spartan-token"; // placeholder
 
-  const authHeader = `XBL3.0 x=${uhs};${xstsToken}`;
+async function getSpartanToken(xstsToken, uhs) {
+  // Two common header styles. We’ll try the "343 identity" header first.
+  const headers = {
+    "x-343-identity-provider": "xbl3",
+    "x-343-authorization-spartan": `XBL3.0 x=${uhs};${xstsToken}`,
+    "Content-Type": "application/json",
+  };
 
-  // Some endpoints accept "Spartan-Token" (or x-343-authorization-spartan)
+  const r = await fetch(SPARTAN_TOKEN_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({}),
+  });
+  const text = await r.text();
+  if (!r.ok) {
+    logHttpError("spartan-token", r, text);
+    throw new Error(`spartan-token failed: ${r.status}`);
+  }
+  // Caller usually just needs OK; if there is a JSON, return it:
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: true };
+  }
+}
+
+function buildHaloHeaders(xstsToken, uhs) {
   return {
-    Authorization: authHeader,
-    "Spartan-Token": spartan?.spartanToken ?? spartan?.SpartanToken ?? "",
-    "Accept": "application/json"
+    "x-343-identity-provider": "xbl3",
+    "x-343-authorization-spartan": `XBL3.0 x=${uhs};${xstsToken}`,
   };
 }
 
-// --------------------- Public/Worker Routes ---------------------
+// ------------------------------
+// Routes
+// ------------------------------
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
-/**
- * GET /spartan?gt=<gamertag>&playlist=<playlistId>
- * headers: x-grunt-auth: <GRUNT_SHARED_SECRET>
- *
- * Returns: { csr, tier, ... } — directly from Halo CSR endpoint
- */
-app.get("/spartan", mustWrapper, async (req, res) => {
+// 1) Start auth — user consents to Xbox scopes
+app.get("/auth/start", (req, res) => {
+  const scope = encodeURIComponent("XboxLive.signin XboxLive.offline_access openid profile");
+  const url =
+    `${AUTHORITY}/oauth20_authorize.srf?` +
+    `client_id=${encodeURIComponent(CLIENT_ID)}` +
+    `&scope=${scope}` +
+    `&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+  res.redirect(url);
+});
+
+// 2) Callback — exchange code for tokens
+app.get("/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing code");
   try {
-    const gamertag = (req.query.gt || "").toString().trim();
-    const playlistId = (req.query.playlist || "").toString().trim();
+    const json = await tokenRequest({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: "authorization_code",
+      code: code,
+      redirect_uri: REDIRECT_URI,
+    });
+    tokenStore.access_token = json.access_token || null;
+    tokenStore.refresh_token = json.refresh_token || null;
+    tokenStore.expires_at = nowSec() + (json.expires_in || 3600);
 
-    if (!gamertag || !playlistId) {
-      return bad(res, 400, "missing gt or playlist");
-    }
-
-    // Build headers (Xbox + XSTS + Spartan)
-    const headers = await buildHaloHeaders();
-
-    // Fill endpoint template
-    const url = fillHaloEndpoint(HALO_ENDPOINT, { gamertag, playlistId });
-
-    const r = await fetch(url, { headers });
-    if (!r.ok) {
-      const body = await r.text().catch(() => "");
-      console.error("Halo CSR error", r.status, body);
-      return bad(res, 502, "halo_upstream_error");
-    }
-
-    const data = await r.json();
-
-    // For your Worker convenience you can return just {csr,tier} if present:
-    // The payloads differ; this maps common shapes (adjust as needed).
-    let csrValue = null, tierValue = null;
-
-    // Example shapes (you may refine after seeing live payload)
-    if (Array.isArray(data?.Result ?? data?.results)) {
-      const first = (data.Result ?? data.results)[0] ?? {};
-      csrValue = first?.csr ?? first?.current?.value ?? null;
-      tierValue = first?.tier ?? first?.current?.tier ?? null;
-    } else if (data?.csr || data?.tier) {
-      csrValue = data.csr ?? null;
-      tierValue = data.tier ?? null;
-    }
-
-    ok(res, { raw: data, csr: csrValue, tier: tierValue });
+    res.send(
+      `<html><body><h3>Signed in!</h3><p>You can close this window.</p>` +
+        `<script>setTimeout(()=>window.close(), 1000)</script></body></html>`
+    );
   } catch (e) {
-    console.error("/spartan error:", e);
-    bad(res, 500, "spartan_failed");
+    res.status(500).send(String(e));
   }
 });
 
-// --------------------- Admin/Health ---------------------
-
-app.get("/health", (req, res) => ok(res, { ok: true }));
-
-app.get("/admin/status", mustAdmin, (req, res) => {
-  ok(res, {
+// Admin status (token info)
+app.get("/admin/status", adminGuard, (_req, res) => {
+  res.json({
     ok: true,
-    usingAuthority: AZURE_AUTHORITY,
-    clientIdEndsWith: (AZURE_CLIENT_ID || "").slice(-6),
-    hasSecret: !!AZURE_CLIENT_SECRET,
-    redirectUri: AZURE_REDIRECT_URI,
-    tokenStoreSize: cachedAccount ? 1 : 0,
-    tokenExpiresInSec: null,
-    xstsExpiresAt: tokenStore.xstsExpiresAt,
-    spartanExpiresAt: tokenStore.spartanExpiresAt,
+    usingAuthority: AUTHORITY,
+    clientIdEndsWith: CLIENT_ID.slice(-6),
+    hasSecret: !!CLIENT_SECRET,
+    redirectUri: REDIRECT_URI,
+    tokenStoreSize: tokenStore.access_token ? 1 : 0,
+    tokenExpiresInSec: tokenStore.access_token
+      ? Math.floor(msUntilExpiry() / 1000)
+      : null,
   });
 });
 
-// --------------- Server ---------------
+// Diagnostic: run XBL → XSTS → Spartan and show result
+app.get("/diag/spartan", adminGuard, async (_req, res) => {
+  try {
+    const msAccess = await ensureAccessToken();
+    const user = await getXblUserToken(msAccess);
+    const xsts = await getXstsToken(user.Token);
+    const uhs = xsts?.DisplayClaims?.xui?.[0]?.uhs;
+    const spartan = await getSpartanToken(xsts.Token, uhs);
+    res.json({ ok: true, uhs, spartan: !!spartan });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
-app.listen(Number(PORT), () => {
+// Used by the Worker wrapper; requires shared secret header.
+app.get("/spartan", async (req, res) => {
+  try {
+    const hdr = req.headers["x-grunt-auth"];
+    if (!hdr || hdr !== GRUNT_SHARED_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const gt = req.query.gt;
+    const playlist = req.query.playlist;
+    if (!gt || !playlist) {
+      return res.status(400).json({ ok: false, error: "missing gt or playlist" });
+    }
+
+    // Acquire chain + Spartan token; build standard Halo headers.
+    const msAccess = await ensureAccessToken();
+    const user = await getXblUserToken(msAccess);
+    const xsts = await getXstsToken(user.Token);
+    const uhs = xsts?.DisplayClaims?.xui?.[0]?.uhs;
+    await getSpartanToken(xsts.Token, uhs); // mainly to verify we have one; some stacks require this hop
+
+    const haloHeaders = buildHaloHeaders(xsts.Token, uhs);
+    // TODO: call the real Halo endpoint you choose here, using haloHeaders.
+    // For now we return a minimal OK with info to avoid stubbing rank:
+    return res.json({ ok: true, headersReady: true });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: String(e) });
+  }
+});
+
+// Root
+app.get("/", (_req, res) => {
+  res.send("Halo Grunt up");
+});
+
+// ------------------------------
+app.listen(PORT, () => {
   console.log(`Halo Grunt listening on :${PORT}`);
-  console.log(`Health: GET   /health`);
-  console.log(`Login:  GET   /auth/start?key=YOUR_ADMIN_KEY`);
-  console.log(`Status: GET   /admin/status?key=YOUR_ADMIN_KEY`);
+  console.log(`Health: GET  /health`);
+  console.log(`Login:  GET  /auth/start?key=YOUR_ADMIN_KEY (no key required here)`);
+  console.log(`Status: GET  /admin/status?key=YOUR_ADMIN_KEY`);
+  console.log(`Diag:   GET  /diag/spartan?key=YOUR_ADMIN_KEY`);
   console.log(`CSR (worker): GET  /spartan   (needs x-grunt-auth header)`);
 });
+
