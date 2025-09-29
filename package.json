@@ -1,17 +1,15 @@
 {
   "name": "halo-grunt-service",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "@azure/msal-node": "^2.6.5"
-  },
-  "engines": {
-    "node": ">=18"
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "querystring": "^0.2.1"
   }
 }
